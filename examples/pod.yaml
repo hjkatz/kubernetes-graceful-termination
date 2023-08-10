@@ -1,0 +1,32 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: graceful-terminator
+  deletionTimestamp: "2001-01-01T10:00:00Z" # set by apiserver
+  deletionGracePeriodSeconds: 60 # set by apiserver
+spec:
+  terminationGracePeriodSeconds: 60 # default 30
+  containers:
+  - name: graceful-terminator
+    image: hjkatz/graceful-terminator # pid 1 will receive SIGTERM
+    lifecycle:
+      preStop:
+        exec:
+          # takes time away from SIGTERM -> container pid 1
+          command: ["echo", "Received preStop hook"]
+    ports:
+    - containerPort: 8080
+    livenessProbe:
+      httpGet:
+        path: /alive
+        port: 8080
+    readinessProbe:
+      httpGet:
+        path: /ready
+        port: 8080
+    resources:
+      requests:
+        memory: 128Mi
+        cpu: 100m
+      limits:
+        memory: 128Mi
