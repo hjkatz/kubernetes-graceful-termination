@@ -1,0 +1,35 @@
+# For use in local kind cluster
+
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: graceful-terminator
+  namespace: default
+spec:
+  terminationGracePeriodSeconds: 60 # default 30
+  containers:
+  - name: graceful-terminator
+    imagePullPolicy: Never
+    image: hjkatz/kubernetes-graceful-termination:local # pid 1 will receive SIGTERM
+    lifecycle:
+      preStop:
+        exec:
+          # takes time away from SIGTERM -> container pid 1
+          command: ["echo", "Received preStop hook"]
+    # use downward api to provide container with $POD_NAME and $POD_NAMESPACE
+    env:
+    - name: POD_NAME
+      valueFrom:
+        fieldRef:
+          fieldPath: metadata.name
+    - name: POD_NAMESPACE
+      valueFrom:
+        fieldRef:
+          fieldPath: metadata.namespace
+    resources:
+      requests:
+        memory: 128Mi
+        cpu: 100m
+      limits:
+        memory: 128Mi

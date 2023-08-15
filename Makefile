@@ -67,3 +67,14 @@ container: build-linux
 	docker build -t ${REPO}:${COMMIT_SHA} -f Dockerfile .
 	docker tag ${REPO}:${COMMIT_SHA} ${REPO}:local
 	@echo "Built ${REPO}:local"
+
+.PHONY: kind
+kind: container
+	kind load docker-image $(REPO):local
+	kubectl apply --force -f ./examples/pod.yaml
+
+.PHONY: publish-docker
+publish-docker: container
+	docker tag $(REPO):local $(REPO):latest
+	docker push $(REPO):latest
+	@echo "Published $(REPO):latest"

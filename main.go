@@ -4,12 +4,17 @@ import (
 	"context"
 	"errors"
 	"log"
+	"math"
 	"net/http"
 	"os"
 	"os/signal"
 	"sync"
 	"syscall"
 	"time"
+
+	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/rest"
 )
 
 type State string
@@ -31,6 +36,7 @@ var (
 	_server       *http.Server
 	_startupOnce  sync.Once
 	_shutdownOnce sync.Once
+	_k8s          kubernetes.Interface
 )
 
 func init() {
@@ -42,7 +48,7 @@ func init() {
 
 func main() {
 	// Example function to run forever, print the global state, and move between states
-	for {
+	for range time.Tick(1 * time.Second) {
 		printGlobalState()
 
 		switch _global.State {
@@ -58,13 +64,12 @@ func main() {
 		default:
 			panic("unknown state: " + _global.State)
 		}
-
-		time.Sleep(1 * time.Second)
 	}
 }
 
 func startup() {
 	log.Println("Starting up...")
+	setupK8sClient()
 	go waitForShutdown()
 	go startWebserver()
 
@@ -75,9 +80,12 @@ func startup() {
 func shutdown() {
 	log.Println("Shutting down...")
 
-	ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(5*time.Second))
-	drainConnections(ctx)
-	stopWebserver(ctx)
+	deadline := calculateShutdownDeadline()
+	log.Printf("Server must shutdown before deadline: %s", deadline)
+
+	ctx, cancel := context.WithDeadline(context.Background(), deadline)
+	go drainConnections(ctx)
+	go stopWebserver(ctx)
 
 	// wait for deadline
 	<-ctx.Done()
@@ -85,7 +93,9 @@ func shutdown() {
 	// ensure everything is stopped
 	cancel()
 
-	// all done
+	// wait a moment for go routines to finish any cleanup
+	time.Sleep(500 * time.Millisecond)
+
 	log.Println("Exiting...")
 	os.Exit(0)
 }
@@ -102,14 +112,113 @@ func waitForShutdown() {
 	setGlobalState(StateShutdown)
 }
 
+func calculateShutdownDeadline() time.Time {
+	if !isRunningInsideKubernetesPod() {
+		defaultDeadline := time.Now().Add(10 * time.Second)
+		log.Printf("Running outside kubernetes, setting shutdown deadline to default: %s", defaultDeadline)
+		return defaultDeadline
+	}
+
+	log.Printf("Running inside kubernetes, polling Pod metadata to calculate deadline")
+	deletionTime, gracePeriod := getPodDeletionInfo()
+
+	log.Printf("Pod is expected to be deleted in %s at %s\n", gracePeriod, deletionTime)
+
+	// choose some jitter time between min(5% of gracePeriod, 10s)
+	// this time represents however long we think it may maximally take
+	// our program to reach this point since receiving SIGTERM
+	fivePercentSeconds := int(gracePeriod.Seconds() / 100 * 5)
+	floorSeconds := 10
+	jitterSeconds := floorSeconds
+	if fivePercentSeconds > floorSeconds {
+		jitterSeconds = fivePercentSeconds
+	}
+	if time.Until(deletionTime).Seconds() < float64(jitterSeconds) {
+		log.Printf("WARN: jitter time longer than remaining gracePeriod, defaulting to 0\n")
+		jitterSeconds = 0
+	}
+	log.Printf("calculated jitter of %d\n", jitterSeconds)
+
+	// calculate deadline
+	deadline := deletionTime.Add(-(time.Second * time.Duration(jitterSeconds)))
+	return deadline
+}
+
+// getPodDeletionInfo polls the k8s api for $POD_NAME in $POD_NAMESPACE and
+// returns `.metadata.deletionTimestamp`, `.metadata.deletionGracePeriodSeconds`
+func getPodDeletionInfo() (time.Time, time.Duration) {
+	podName := os.Getenv("POD_NAME")
+	podNamespace := os.Getenv("POD_NAMESPACE")
+
+	maxAttempts := 5
+	attempt := 0
+
+	for attempt <= maxAttempts {
+		attempt++
+
+		pod, err := _k8s.CoreV1().Pods(podNamespace).Get(context.TODO(), podName, v1.GetOptions{})
+		if err != nil {
+			log.Printf("Error while fetching Pod deletion info: %s\n", err)
+			time.Sleep(100 * time.Millisecond)
+			continue
+		}
+
+		deletionTimestamp := pod.ObjectMeta.DeletionTimestamp
+		deletionGracePeriodSeconds := pod.ObjectMeta.DeletionGracePeriodSeconds
+
+		if deletionTimestamp != nil && deletionGracePeriodSeconds != nil {
+			return deletionTimestamp.Time, time.Duration(*deletionGracePeriodSeconds) * time.Second
+		}
+
+		// backoff
+		log.Println("Fetched Pod metadata, but deletion info was still empty!")
+		time.Sleep(500 * time.Millisecond)
+	}
+
+	// some default
+	log.Println("Failed to fetch Pod deletion info in a timely manner, returning default")
+	return time.Now(), 20 * time.Second
+}
+
 // Example function to simulate draining connections during shutdown at different rates
 func drainConnections(ctx context.Context) {
-	log.Println("Draining connections...")
+	deadline, _ := ctx.Deadline()
+	timeRemaining := time.Until(deadline)
+	activeConnections := 1000
+	batchSize := int(float64(activeConnections) / math.Max(timeRemaining.Seconds()-1, 1.0))
+	maxBatchSize := 100 // per second
 
-	for i := 0; i <= 3; i++ {
-		time.Sleep(1 * time.Second)
-		log.Printf("Draining conn: %d", i)
+	if batchSize > maxBatchSize {
+		log.Printf("Calculated batchSize of %d is too large, using default size of %d per second instead\n", batchSize, maxBatchSize)
+		batchSize = maxBatchSize
 	}
+
+	log.Printf("Draining %d connections in batches of %d over %s\n", activeConnections, batchSize, timeRemaining)
+
+	go func() {
+		<-ctx.Done()
+		if activeConnections > 0 {
+			log.Fatalf("Unable to safely shutdown in time, dropping %d connections on the floor...\n", activeConnections)
+		}
+	}()
+
+	for activeConnections > 0 {
+		activeConnections -= batchSize
+		// real connections wouldn't be negative
+		if activeConnections < 0 {
+			activeConnections = 0
+		}
+
+		if activeConnections <= 0 {
+			break
+		}
+
+		log.Printf("Draining %d connections, %d left\n", batchSize, activeConnections)
+
+		time.Sleep(1 * time.Second)
+	}
+
+	log.Printf("Successfully drained all connections\n")
 }
 
 func startWebserver() {
@@ -145,4 +254,27 @@ func setGlobalState(nextState State) {
 	defer _global.mu.Unlock()
 	log.Printf("Setting state from '%s' -> '%s'", _global.State, nextState)
 	_global.State = nextState
+}
+
+func isRunningInsideKubernetesPod() bool {
+	return os.Getenv("KUBERNETES_SERVICE_HOST") != ""
+}
+
+func setupK8sClient() {
+	if !isRunningInsideKubernetesPod() {
+		log.Println("Not running inside kubernetes, skipping setupK8sClient...")
+		return
+	}
+
+	log.Print("Running inside kubernetes, setting up k8s client...")
+
+	config, err := rest.InClusterConfig()
+	if err != nil {
+		panic(err.Error())
+	}
+
+	_k8s, err = kubernetes.NewForConfig(config)
+	if err != nil {
+		panic(err.Error())
+	}
 }
